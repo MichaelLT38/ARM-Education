@@ -7,97 +7,134 @@
 #include "stm32l475e_iot01_tsensor.h"
 #include "stm32l475e_iot01_hsensor.h"
 #include "stm32l475e_iot01_psensor.h"
-#include "stm32l475e_iot01_magneto.h"
-#include "stm32l475e_iot01_accelero.h"
-#include "stm32l475e_iot01_gyro.h"
 #include <cstdint>
+#include "ble/BLE.h"
+#include "ble_process.h"
+#include <events/mbed_events.h>
 
-static DigitalOut led(LED1);
-static BufferedSerial serial_port(USBTX, USBRX, 9600);
 
-static LowPowerTicker ledTicker;
-static LowPowerTicker readoutTicker;
+class SensorReadingCharacteristic : public GattCharacteristic {
+    public:
+        SensorReadingCharacteristic(const UUID &uuid) 
+            : GattCharacteristic(
+                uuid, (uint8_t *)&stringRepr_, sizeof(stringRepr_),
+                sizeof(stringRepr_),
+                GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ |
+                    GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY),
+            internalValue_(0) {
+                updateStringRepr();
+            }
+        void updateValue(BLE &ble, float newValue) {
+            internalValue_ = newValue;
+            updateStringRepr();
 
-static bool shouldReadSensors;
+            ble.gattServer().write(getValueHandle(), (uint8_t *)&stringRepr_, sizeof(stringRepr_));
+        }
 
-FileHandle *mbed::mbed_override_console(int fd)
-{
-    return &serial_port;
-}
+    private:
+        float internalValue_;
+        uint8_t stringRepr_[16];
 
-static void ledTick()
-{
-    led = !led;
-}
-
-static void readoutTick()
-{
-    shouldReadSensors = true;
-}
+        void updateStringRepr() {
+            sprintf((char *)stringRepr_, "%f", internalValue_);
+        }
+    
+};
 
 static void initialiseSensors()
 {
     BSP_TSENSOR_Init();
     BSP_HSENSOR_Init();
     BSP_PSENSOR_Init();
-    BSP_MAGNETO_Init();
-    BSP_ACCELERO_Init();
-    BSP_GYRO_Init();
 }
 
-static float convertCelsiusToFahrenheit(float t)
+static float Merica(float t)
 {
     return ((t * 9.) / 5.) + 32.;
 }
 
-static float convertCelsiusToKelvin(float t)
-{
-    return t + 273.15;
-}
+class Lab3Server : ble::GattServer::EventHandler {
+    public:
+        Lab3Server() 
+            : temperature_(GattCharacteristic::UUID_TEMPERATURE_CHAR),
+            humidity_(GattCharacteristic::UUID_HUMIDITY_CHAR),
+            pressure_(GattCharacteristic::UUID_PRESSURE_CHAR), 
+            led_(LED1),
+            ledValue_(0), 
+            ledChar_(0xA000, &ledValue_) {}
 
-static void readSensors()
-{
-    printf("Sensor values:\n");
+        ~Lab3Server() {}
 
-    float temp = BSP_TSENSOR_ReadTemp();
-    printf("* Temperature: %f C, %f F, %f K\n", temp, convertCelsiusToFahrenheit(temp), convertCelsiusToKelvin(temp));
+        void start(BLE &ble, events::EventQueue &event_queue) {
+            const UUID uuid = GattService::UUID_ENVIRONMENTAL_SERVICE;
 
-    float hum = BSP_HSENSOR_ReadHumidity();
-    printf("* Humidity: %f\n", hum);
+            GattCharacteristic *charTable[] = {&temperature_, &humidity_, &pressure_, &ledChar_};
 
-    float prs = BSP_PSENSOR_ReadPressure();
-    printf("* Pressure: %f\n", prs);
+            GattService sensorService(uuid, charTable, sizeof(charTable) / sizeof(charTable[0]));
 
-    int16_t magneto[3];
-    BSP_MAGNETO_GetXYZ(magneto);
-    printf("* Magneto: %d %d %d\n", magneto[0], magneto[1], magneto[2]);
+            ble.gattServer().addService(sensorService);
 
-    float gyro[3];
-    BSP_GYRO_GetXYZ(gyro);
-    printf("* Gyro: %f %f %f\n", gyro[0], gyro[1], gyro[2]);
+            ble.gattServer().setEventHandler(this);
 
-    int16_t accel[3];
-    BSP_ACCELERO_AccGetXYZ(accel);
-    printf("* Accelerometer: %d %d %d\n", accel[0], accel[1], accel[2]);
-}
+            event_queue.call_every(1000ms, [this, &ble] {updateSensors(ble);});
+
+            printf("Service started.\n");
+        }
+
+        private:
+
+            void updateSensors(BLE &ble) {
+                printf("Updating sensors...\n");
+
+                temperature_.updateValue(ble, Merica(BSP_TSENSOR_ReadTemp()));
+                humidity_.updateValue(ble, BSP_HSENSOR_ReadHumidity());
+                pressure_.updateValue(ble, BSP_PSENSOR_ReadPressure());
+            }
+
+            virtual void onDataWritten(const GattWriteCallbackParams &params) override {
+                if ((params.handle == ledChar_.getValueHandle()) && (params.len == 1)) {
+                    printf("New LED value: %x\r\n", *(params.data));
+                    ledValue_ = *(params.data);
+                    led_ = ledValue_;
+                }
+            }
+
+            SensorReadingCharacteristic temperature_;
+            SensorReadingCharacteristic humidity_;
+            SensorReadingCharacteristic pressure_;
+
+            DigitalOut led_;
+            uint8_t ledValue_;
+            ReadWriteGattCharacteristic<uint8_t> ledChar_;
+
+};
+
+class Lab3ServerProcess : public BLEProcess {
+    public:
+        Lab3ServerProcess(events::EventQueue &event_queue, BLE &ble_interface)
+            : BLEProcess(event_queue, ble_interface) {}
+
+        const char *get_device_name() override {
+            static const char name[] = "Lab 3 Server";
+            return name;
+        }
+};
+
+static EventQueue event_queue(10 * EVENTS_EVENT_SIZE);
 
 int main()
 {
-    led = true;
-    printf("Hello, world.\n");
-
     initialiseSensors();
 
-    ledTicker.attach(&ledTick, 1s);
-    readoutTicker.attach(&readoutTick, 3s);
+    BLE &ble = BLE::Instance();
 
-    while (true) {
-        sleep();
-        if (shouldReadSensors) {
-            readSensors();
-            shouldReadSensors = false;
-        }
-    }
+    printf("Lab 3 - BLE");
+
+    Lab3ServerProcess ble_process(event_queue, ble);
+    Lab3Server server;
+
+    ble_process.on_init(callback(&server, &Lab3Server::start));
+    ble_process.start();
 
     return 0;
 }
